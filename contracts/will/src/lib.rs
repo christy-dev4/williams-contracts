@@ -624,6 +624,11 @@ const GUARDIAN_COOLDOWN_DAYS: u64 = 7;
 /// `refund_unconfirmed_will` can be called to return trapped funds (#40).
 pub const UNCONFIRMED_WILL_REFUND_GRACE_DAYS: u64 = 7;
 
+/// Minimum confirmation delay (in seconds) for a non-zero
+/// `confirmation_delay_seconds` (#103). Sub-threshold micro-delays provide
+/// false security against automated transaction sequencing attacks.
+pub const MIN_CONFIRMATION_DELAY: u64 = 300;
+
 /// Maximum keeper bounty in basis points (100 bps = 1%).
 const MAX_KEEPER_BOUNTY_BPS: u32 = 100;
 
@@ -920,6 +925,14 @@ impl WillContract {
 
         let will_id = storage::next_will_id(&env);
         let now = env.ledger().timestamp();
+
+        // Non-zero confirmation delays must satisfy the minimum duration
+        // threshold so trivial micro-delays cannot bypass protection (#103).
+        if confirmation_delay_seconds > 0
+            && confirmation_delay_seconds < MIN_CONFIRMATION_DELAY
+        {
+            panic_with_error!(&env, WillError::InvalidPeriod);
+        }
 
         let token_count = balances.len();
         for beneficiary in beneficiaries.iter() {
