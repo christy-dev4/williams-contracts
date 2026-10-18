@@ -624,6 +624,11 @@ const GUARDIAN_COOLDOWN_DAYS: u64 = 7;
 /// `refund_unconfirmed_will` can be called to return trapped funds (#40).
 pub const UNCONFIRMED_WILL_REFUND_GRACE_DAYS: u64 = 7;
 
+/// Maximum additional grace days an owner may request via
+/// `request_grace_extension` (#102), preventing indefinite stalling of an
+/// estate in `Triggered` state.
+pub const MAX_GRACE_EXTENSION_DAYS: u64 = 30;
+
 /// Maximum keeper bounty in basis points (100 bps = 1%).
 const MAX_KEEPER_BOUNTY_BPS: u32 = 100;
 
@@ -971,6 +976,7 @@ impl WillContract {
             keeper_bounty_bps: keeper_bounty,
             keeper_bounty_token: None,
             delegate: None,
+            grace_extension_days: 0,
         };
         storage::save_will(&env, &will);
         storage::index_by_owner(&env, &owner, will_id);
@@ -1694,6 +1700,65 @@ impl WillContract {
             checked_days_to_seconds(&env, will.checkin_period_days),
         );
         events::emergency_checkin(&env, will_id, &owner, next_deadline);
+        storage::bump_instance_ttl(&env);
+    }
+
+    /// Requests a temporary grace period extension during `Triggered` state
+    /// (#102). The extension stacks on top of the will's base
+    /// `grace_period_days` without resetting the check-in cycle.
+    ///
+    /// # Panics
+    /// - [`WillError::NotOwner`] if `owner` does not own `will_id`.
+    /// - [`WillError::WillNotTriggered`] if the will is not `Triggered`.
+    /// - [`WillError::GracePeriodExpired`] if the grace period has already
+    ///   elapsed.
+    /// - [`WillError::InvalidPeriod`] if `extra_days` is zero or exceeds
+    ///   [`MAX_GRACE_EXTENSION_DAYS`].
+    pub fn request_grace_extension(
+        env: Env,
+        will_id: u64,
+        owner: Address,
+        extra_days: u64,
+    ) {
+        owner.require_auth();
+        let mut will = load_owned(&env, will_id, &owner);
+        assert_status(
+            &env,
+            &will,
+            WillStatus::Triggered,
+            WillError::WillNotTriggered,
+        );
+
+        if extra_days == 0 || extra_days > MAX_GRACE_EXTENSION_DAYS {
+            panic_with_error!(&env, WillError::InvalidPeriod);
+        }
+
+        let now = env.ledger().timestamp();
+        if now > grace_deadline(&env, &will) {
+            panic_with_error!(&env, WillError::GracePeriodExpired);
+        }
+
+        will.grace_extension_days = will
+            .grace_extension_days
+            .saturating_add(extra_days);
+        storage::save_will(&env, &will);
+
+        record_transition(
+            &env,
+            will_id,
+            WillStatus::Triggered,
+            WillStatus::Triggered,
+            &owner,
+            symbol_short!("grace"),
+        );
+
+        events::grace_extension_requested(
+            &env,
+            will_id,
+            &owner,
+            extra_days,
+            will.grace_extension_days,
+        );
         storage::bump_instance_ttl(&env);
     }
 
@@ -4139,6 +4204,7 @@ impl WillContract {
             // bounty token stays held by the clone (#109).
             keeper_bounty_token: source.keeper_bounty_token.clone(),
             delegate: None,
+            grace_extension_days: 0,
         };
         storage::save_will(&env, &will);
         storage::index_by_owner(&env, &owner, will_id);
@@ -4351,6 +4417,7 @@ impl WillContract {
                 keeper_bounty_bps: 0,
                 keeper_bounty_token: None,
                 delegate: None,
+                grace_extension_days: 0,
             };
             storage::save_will(&env, &will);
             storage::index_by_owner(&env, &owner, will_id);
@@ -5234,6 +5301,7 @@ impl WillContract {
             keeper_bounty_bps: 0,
             keeper_bounty_token: None,
             delegate: None,
+            grace_extension_days: 0,
         };
         storage::save_will(&env, &child);
         storage::index_by_owner(&env, &source.owner, new_id);
@@ -6213,7 +6281,8 @@ fn grace_deadline(env: &Env, will: &Will) -> u64 {
         let period_seconds = checked_days_to_seconds(env, will.checkin_period_days);
         checked_add_timestamp(env, will.last_checkin, period_seconds)
     });
-    let grace_seconds = checked_days_to_seconds(env, will.grace_period_days);
+    let grace_seconds =
+        checked_days_to_seconds(env, will.grace_period_days + will.grace_extension_days);
     checked_add_timestamp(env, start, grace_seconds)
 }
 
