@@ -944,6 +944,14 @@ impl WillContract {
         let will_id = storage::next_will_id(&env);
         let now = env.ledger().timestamp();
 
+        // Non-zero confirmation delays must satisfy the minimum duration
+        // threshold so trivial micro-delays cannot bypass protection (#103).
+        if confirmation_delay_seconds > 0
+            && confirmation_delay_seconds < MIN_CONFIRMATION_DELAY
+        {
+            panic_with_error!(&env, WillError::InvalidPeriod);
+        }
+
         let token_count = balances.len();
         for beneficiary in beneficiaries.iter() {
             storage::index_by_beneficiary(&env, &beneficiary.address, will_id);
