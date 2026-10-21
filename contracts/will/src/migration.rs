@@ -158,7 +158,7 @@ pub mod legacy {
                 keeper_bounty_bps: self.keeper_bounty_bps,
                 keeper_bounty_token: None,
                 delegate: self.delegate,
-                trigger_cooldown_until: 0,
+                grace_extension_days: 0,
             }
         }
     }
