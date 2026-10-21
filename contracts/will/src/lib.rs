@@ -491,9 +491,9 @@ pub use errors::WillError;
 pub use migration::CURRENT_SCHEMA_VERSION;
 pub use storage::GuardianVoteRecord;
 pub use types::{
-    Allocation, Beneficiary, Guardian, GuardianConsent, GuardianSpec, GuardianVoteReason,
-    HashedBeneficiary, OwnerStats, ProtocolStats, ProtocolStatsAudit, TokenLockedBalance, Will,
-    WillPage, WillStatus, WillStatusTransition,
+    Allocation, Beneficiary, FailedPayoutRequest, Guardian, GuardianConsent, GuardianSpec,
+    GuardianVoteReason, HashedBeneficiary, OwnerStats, ProtocolStats, ProtocolStatsAudit,
+    TokenLockedBalance, Will, WillPage, WillStatus, WillStatusTransition,
 };
 
 /// Semantic version of the contract logic, encoded as
@@ -624,6 +624,16 @@ const GUARDIAN_COOLDOWN_DAYS: u64 = 7;
 /// `refund_unconfirmed_will` can be called to return trapped funds (#40).
 pub const UNCONFIRMED_WILL_REFUND_GRACE_DAYS: u64 = 7;
 
+/// Minimum interval (in seconds) between two `check_in` state updates
+/// (#101). Consecutive check-ins within the same minute do not write
+/// redundant history entries.
+const MIN_CHECKIN_INTERVAL: u64 = 60;
+
+/// Minimum confirmation delay (in seconds) for a non-zero
+/// `confirmation_delay_seconds` (#103). Sub-threshold micro-delays provide
+/// false security against automated transaction sequencing attacks.
+pub const MIN_CONFIRMATION_DELAY: u64 = 300;
+
 /// Maximum additional grace days an owner may request via
 /// `request_grace_extension` (#102), preventing indefinite stalling of an
 /// estate in `Triggered` state.
@@ -631,7 +641,6 @@ pub const MAX_GRACE_EXTENSION_DAYS: u64 = 30;
 
 /// Maximum keeper bounty in basis points (100 bps = 1%).
 const MAX_KEEPER_BOUNTY_BPS: u32 = 100;
-
 /// Maximum number of ids that can be passed to `get_wills` in a single call.
 const MAX_GET_WILLS_IDS: u32 = 50;
 
@@ -838,6 +847,15 @@ impl WillContract {
         assert_beneficiary_count(&env, &beneficiaries);
         assert_valid_guardians(&env, &owner, &guardians);
         assert_valid_periods(&env, checkin_period_days, grace_period_days);
+
+        // Non-zero confirmation delays must satisfy the minimum duration
+        // threshold so trivial micro-delays cannot bypass protection
+        // (#103).
+        if confirmation_delay_seconds > 0
+            && confirmation_delay_seconds < MIN_CONFIRMATION_DELAY
+        {
+            panic_with_error!(&env, WillError::InvalidPeriod);
+        }
 
         // Validate and normalise the guardian threshold.
         //
@@ -1359,6 +1377,15 @@ impl WillContract {
         assert_owner_or_delegate(&env, &will, &caller);
 
         let now = env.ledger().timestamp();
+
+        // Rate-limit state updates: only refresh `last_checkin` if at least
+        // `MIN_CHECKIN_INTERVAL` has elapsed since the last check-in.
+        // Consecutive check-ins within the same window are no-ops that avoid
+        // redundant history writes (#101).
+        if now < will.last_checkin.saturating_add(MIN_CHECKIN_INTERVAL) {
+            return;
+        }
+
         will.last_checkin = now;
         let next_deadline = checked_add_timestamp(
             &env,
@@ -1705,7 +1732,8 @@ impl WillContract {
 
     /// Requests a temporary grace period extension during `Triggered` state
     /// (#102). The extension stacks on top of the will's base
-    /// `grace_period_days` without resetting the check-in cycle.
+    /// `grace_period_days` without resetting the check-in cycle, giving an
+    /// incapacitated owner extra time without forfeiting the estate.
     ///
     /// # Panics
     /// - [`WillError::NotOwner`] if `owner` does not own `will_id`.
@@ -1738,6 +1766,9 @@ impl WillContract {
             panic_with_error!(&env, WillError::GracePeriodExpired);
         }
 
+        // Stack the extension on top of the existing one. The effective
+        // grace deadline is trigger_time + (grace_period_days +
+        // grace_extension_days) * SECONDS_PER_DAY.
         will.grace_extension_days = will
             .grace_extension_days
             .saturating_add(extra_days);
@@ -1923,7 +1954,77 @@ impl WillContract {
         );
 
         storage::remove_failed_payout(&env, will_id, &token, &recipient);
-        events::payout_retried(&env, will_id, &token, &recipient, amount);
+        // The exact `(will_id, token, recipient)` tuple is now resolved.
+        events::payout_retried(&env, will_id, &token, &recipient, amount, true);
+    }
+
+    /// Retries up to [`BATCH_MAX`] failed payouts in a single invocation (#108).
+    ///
+    /// Each request names a `(will_id, token, recipient)` tuple with a
+    /// recorded failed payout. For every request that still has a recorded
+    /// amount, the contract transfers that amount to the recipient, clears
+    /// the failed-payout record, and emits `payout_retried`. Requests with no
+    /// recorded failed payout are skipped and left recorded so they can be
+    /// retried later.
+    ///
+    /// Returns the requests that were successfully retried. Entries are
+    /// processed independently: one entry's failure does not abort the batch,
+    /// so mass-outage recovery can make partial progress.
+    ///
+    /// # Panics
+    /// - [`WillError::BatchTooLarge`] if `requests` holds more than
+    ///   [`BATCH_MAX`] entries.
+    pub fn batch_retry_failed_payouts(
+        env: Env,
+        requests: Vec<FailedPayoutRequest>,
+    ) -> Vec<FailedPayoutRequest> {
+        let count: u32 = requests.len();
+        if count > BATCH_MAX {
+            panic_with_error!(&env, WillError::BatchTooLarge);
+        }
+
+        let mut succeeded: Vec<FailedPayoutRequest> = Vec::new(&env);
+
+        let mut idx: u32 = 0;
+        while idx < count {
+            let request = requests.get(idx).expect("batch request in bounds");
+            let amount = match storage::get_failed_payout(
+                &env,
+                request.will_id,
+                &request.token,
+                &request.recipient,
+            ) {
+                Some(amount) => amount,
+                None => {
+                    idx += 1;
+                    continue;
+                }
+            };
+
+            token::Client::new(&env, &request.token).transfer(
+                &env.current_contract_address(),
+                &request.recipient,
+                &amount,
+            );
+
+            storage::remove_failed_payout(
+                &env,
+                request.will_id,
+                &request.token,
+                &request.recipient,
+            );
+            events::payout_retried(
+                &env,
+                request.will_id,
+                &request.token,
+                &request.recipient,
+                amount,
+            );
+            succeeded.push_back(request.clone());
+            idx += 1;
+        }
+
+        succeeded
     }
 
     /// Redirects a recorded failed payout to a new destination address (#19).
@@ -2020,8 +2121,14 @@ impl WillContract {
         owner.require_auth();
         let mut will = load_owned(&env, will_id, &owner);
 
-        // Allow cancellation from both Active and PendingConfirmation (#43).
-        if will.status != WillStatus::Active && will.status != WillStatus::PendingConfirmation {
+        // Allow cancellation from Active, PendingConfirmation, and Triggered
+        // (#43, #105). A Triggered will can be cancelled directly by its owner
+        // without first running `emergency_checkin`, closing the account in a
+        // single transaction.
+        if will.status != WillStatus::Active
+            && will.status != WillStatus::PendingConfirmation
+            && will.status != WillStatus::Triggered
+        {
             panic_with_error!(&env, WillError::WillNotActive);
         }
 
@@ -2044,12 +2151,13 @@ impl WillContract {
         // permanently inflated (#353). A second per-token loop here would
         // deduct each total twice (#5).
 
-        storage::remove_owner_status_index(
-            &env,
-            &will.owner,
-            WillStatus::Active,
-            will_id,
-        );
+        // Prune the owner status index for every status the will may hold
+        // (Active, PendingConfirmation, or Triggered), then drop it from the
+        // global TriggeredWills index if it was triggered (#105).
+        storage::remove_owner_status_index_all(&env, &will.owner, will_id);
+        if prior_status == WillStatus::Triggered {
+            storage::unindex_triggered_will(&env, will_id);
+        }
         will.balance = 0;
         will.balances = Map::new(&env);
         will.status = WillStatus::Cancelled;
