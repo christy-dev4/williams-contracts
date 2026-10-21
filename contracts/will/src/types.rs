@@ -389,6 +389,10 @@ pub struct Will {
     /// elapsed since this timestamp, preventing a compromised owner from
     /// swapping guardians right before a malicious action.
     pub guardian_list_updated_at: u64,
+    /// Additional grace days granted via `request_grace_extension` (#102).
+    /// Stacks on top of the will's base `grace_period_days`; capped at
+    /// `MAX_GRACE_EXTENSION_DAYS` to prevent indefinite stalling.
+    pub grace_extension_days: u64,
     /// Schema version for this will. Used to track which contract version
     /// wrote this state and enable forward/backward compatible migrations.
     /// See `migration.rs` and the "Storage schema versioning" section of

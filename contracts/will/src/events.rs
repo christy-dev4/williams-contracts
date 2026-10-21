@@ -78,6 +78,22 @@ pub fn emergency_checkin(env: &Env, will_id: u64, owner: &Address, next_deadline
     );
 }
 
+/// Published when `request_grace_extension` stacks additional grace days on a
+/// `Triggered` will (#102). Carries the requesting owner, the extension
+/// requested, and the new cumulative extension total.
+pub fn grace_extension_requested(
+    env: &Env,
+    will_id: u64,
+    owner: &Address,
+    extra_days: u64,
+    cumulative_extension_days: u64,
+) {
+    env.events().publish(
+        (symbol_short!("grext"), will_id),
+        (owner.clone(), extra_days, cumulative_extension_days),
+    );
+}
+
 /// Published when inheritance is released to all beneficiaries.
 ///
 /// `token_count` is the number of distinct tokens distributed.
